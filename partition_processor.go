@@ -18,8 +18,10 @@ const (
 	PPStateRecovering
 	// PPStateRunning indicates a running partition processor
 	PPStateRunning
-	// PPStateStopping indicates a stopped partition processor
+	// PPStateStopping indicates a stopping partition processor
 	PPStateStopping
+	// PPStateStopped indicates a stopped partition processor
+	PPStateStopped
 )
 
 // PPRunMode configures how the partition processor participates as part of the processor
@@ -145,7 +147,7 @@ func newPartitionProcessor(partition int32,
 		log:             log,
 		opts:            opts,
 		partition:       partition,
-		state:           NewSignal(PPStateIdle, PPStateRecovering, PPStateRunning, PPStateStopping).SetState(PPStateIdle),
+		state:           NewSignal(PPStateIdle, PPStateRecovering, PPStateRunning, PPStateStopping, PPStateStopped).SetState(PPStateIdle),
 		callbacks:       callbacks,
 		lookups:         lookupTables,
 		consumer:        consumer,
@@ -188,33 +190,20 @@ func (pp *PartitionProcessor) Recovered() bool {
 	return pp.state.IsState(PPStateRunning)
 }
 
-// Errors returns a channel of errors during consumption
-func (pp *PartitionProcessor) Errors() <-chan error {
-	return pp.runnerErrors
-}
-
 // Start initializes the partition processor
 // * recover the table
 // * recover all join tables
 // * run the join-tables in catchup mode
 // * start the processor processing loop to receive messages
-func (pp *PartitionProcessor) Start(ctx context.Context) error {
+func (pp *PartitionProcessor) Start(setupCtx, ctx context.Context) error {
+
+	// runner context
 	ctx, pp.cancelRunnerGroup = context.WithCancel(ctx)
 
 	var runnerCtx context.Context
 	pp.runnerGroup, runnerCtx = multierr.NewErrGroup(ctx)
-	pp.runnerErrors = make(chan error, 1)
-	defer func() {
-		go func() {
-			defer close(pp.runnerErrors)
-			err := pp.runnerGroup.Wait().NilOrError()
-			if err != nil {
-				pp.runnerErrors <- err
-			}
-		}()
-	}()
 
-	setupErrg, setupCtx := multierr.NewErrGroup(ctx)
+	setupErrg, setupCtx := multierr.NewErrGroup(setupCtx)
 
 	pp.state.SetState(PPStateRecovering)
 	defer pp.state.SetState(PPStateRunning)
@@ -253,8 +242,11 @@ func (pp *PartitionProcessor) Start(ctx context.Context) error {
 		return fmt.Errorf("Setup failed. Cannot start processor for partition %d: %v", pp.partition, err)
 	}
 
+	// check if one of the contexts might have been closed in the meantime
 	select {
 	case <-ctx.Done():
+		return nil
+	case <-setupCtx.Done():
 		return nil
 	default:
 	}
@@ -297,24 +289,30 @@ func (pp *PartitionProcessor) Start(ctx context.Context) error {
 	return nil
 }
 
+func (pp *PartitionProcessor) stopping() <-chan struct{} {
+	return pp.state.WaitForStateMin(PPStateStopping)
+}
+
 // Stop stops the partition processor
 func (pp *PartitionProcessor) Stop() error {
 	pp.log.Debugf("Stopping")
 	defer pp.log.Debugf("... Stopping done")
 	pp.state.SetState(PPStateStopping)
-	defer pp.state.SetState(PPStateIdle)
-	errs := new(multierr.Errors)
+	defer pp.state.SetState(PPStateStopped)
 
 	if pp.cancelRunnerGroup != nil {
 		pp.cancelRunnerGroup()
-	}
-	if pp.runnerGroup != nil {
-		errs.Collect(<-pp.Errors())
 	}
 
 	// stop the stats updating/serving loop
 	pp.cancelStatsLoop()
 
+	errs := new(multierr.Errors)
+
+	// wait for the runner to be done
+	errs.Collect(pp.runnerGroup.Wait().NilOrError())
+
+	// close all the tables
 	errg, _ := multierr.NewErrGroup(context.Background())
 	for _, join := range pp.joins {
 		join := join
@@ -328,9 +326,9 @@ func (pp *PartitionProcessor) Stop() error {
 			return pp.table.Close()
 		})
 	}
-	errs.Collect(errg.Wait().NilOrError())
 
-	return errs.NilOrError()
+	// wait for the tables to be done
+	return errs.Collect(errg.Wait().NilOrError())
 }
 
 func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
