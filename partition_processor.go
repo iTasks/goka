@@ -3,6 +3,7 @@ package goka
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -245,8 +246,7 @@ func (pp *PartitionProcessor) Start(setupCtx, ctx context.Context) error {
 	// check if one of the contexts might have been closed in the meantime
 	select {
 	case <-ctx.Done():
-		return nil
-	case <-setupCtx.Done():
+		log.Printf("context done")
 		return nil
 	default:
 	}
@@ -267,6 +267,8 @@ func (pp *PartitionProcessor) Start(setupCtx, ctx context.Context) error {
 
 	// now run the processor in a runner-group
 	pp.runnerGroup.Go(func() error {
+		defer pp.state.SetState(PPStateStopping)
+
 		var err error
 		// depending on the run mode, we'll do
 		switch pp.runMode {
@@ -310,7 +312,9 @@ func (pp *PartitionProcessor) Stop() error {
 	errs := new(multierr.Errors)
 
 	// wait for the runner to be done
-	errs.Collect(pp.runnerGroup.Wait().NilOrError())
+	if err := pp.runnerGroup.Wait().NilOrError(); err != nil {
+		errs.Collect(fmt.Errorf("callback failed: %w", err))
+	}
 
 	// close all the tables
 	errg, _ := multierr.NewErrGroup(context.Background())
@@ -328,7 +332,7 @@ func (pp *PartitionProcessor) Stop() error {
 	}
 
 	// wait for the tables to be done
-	return errs.Collect(errg.Wait().NilOrError())
+	return errs.Collect(errg.Wait().NilOrError()).NilOrError()
 }
 
 func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {

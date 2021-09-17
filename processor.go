@@ -262,37 +262,7 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 		rerr = merrors.NilOrError()
 	}()
 
-	// create kafka consumer
-	consumerGroup, err := g.opts.builders.consumerGroup(g.brokers, string(g.graph.Group()), g.opts.clientID)
-	if err != nil {
-		return fmt.Errorf(errBuildConsumer, err)
-	}
-
-	errg.Go(func() error {
-		consumerErrors := consumerGroup.Errors()
-
-		for {
-			select {
-			case err, ok := <-consumerErrors:
-				if !ok {
-					return nil
-				}
-				var cbErr *errProcessing
-				if errors.As(err, &cbErr) {
-					g.log.Printf("error processing message (non-transient), stopping execution: %v", err)
-					return cbErr
-				}
-
-				g.log.Printf("Error executing group consumer (continuing execution): %v", err)
-			case <-ctx.Done():
-				//  drain the channel and log in case we still have errors in the channel, otherwise they would be muted.
-				for err := range consumerErrors {
-					g.log.Printf("Error executing consumer group: %v", err)
-				}
-			}
-		}
-	})
-
+	var err error
 	g.saramaConsumer, err = g.opts.builders.consumerSarama(g.brokers, g.opts.clientID)
 	if err != nil {
 		return fmt.Errorf("Error creating consumer for brokers [%s]: %v", strings.Join(g.brokers, ","), err)
@@ -337,13 +307,20 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 
 	// run the main rebalance-consume-loop
 	errg.Go(func() error {
-		return g.rebalanceLoop(ctx, consumerGroup)
+		return g.rebalanceLoop(ctx)
 	})
 
 	return errg.Wait().NilOrError()
 }
 
-func (g *Processor) rebalanceLoop(ctx context.Context, consumerGroup sarama.ConsumerGroup) (rerr error) {
+func (g *Processor) rebalanceLoop(ctx context.Context) (rerr error) {
+
+	// create kafka consumer
+	consumerGroup, err := g.opts.builders.consumerGroup(g.brokers, string(g.graph.Group()), g.opts.clientID)
+	if err != nil {
+		return fmt.Errorf(errBuildConsumer, err)
+	}
+
 	var topics []string
 	for _, e := range g.graph.InputStreams() {
 		topics = append(topics, e.Topic())
@@ -366,42 +343,26 @@ func (g *Processor) rebalanceLoop(ctx context.Context, consumerGroup sarama.Cons
 	}()
 
 	for {
-		var (
-			consumeErr = make(chan error)
-		)
-		go func() {
-			g.log.Debugf("consuming from consumer loop")
-			defer g.log.Debugf("consuming from consumer loop done")
-			defer close(consumeErr)
-			err := consumerGroup.Consume(ctx, topics, g)
-			if err != nil {
-				consumeErr <- err
-			}
-		}()
-		select {
-		case err := <-consumeErr:
-			g.log.Debugf("Consumer group loop done, will stop here")
-
-			if err != nil {
-				errs.Collect(err)
-				return
-			}
-		case <-ctx.Done():
-			g.log.Debugf("context closed, waiting for processor to finish up")
-			err := <-consumeErr
-			errs.Collect(err)
-			g.log.Debugf("context closed, waiting for processor to finish up")
-			return
+		err := consumerGroup.Consume(ctx, topics, g)
+		var cbErr *errProcessing
+		if errors.As(err, &cbErr) {
+			g.log.Printf("error processing message (non-transient), stopping execution: %v", err)
+			return cbErr
 		}
-		// let's wait some time before we retry to consume
-		<-time.After(5 * time.Second)
+		g.log.Printf("Error executing group consumer (continuing execution): %v", err)
+
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }
 
 // waits for all tables that are supposed to start up
 func (g *Processor) waitForStartupTables(ctx context.Context) error {
 
-	errg, ctx := multierr.NewErrGroup(ctx)
+	errg, startupCtx := multierr.NewErrGroup(ctx)
 
 	var (
 		waitMap  = make(map[string]struct{})
@@ -431,7 +392,7 @@ func (g *Processor) waitForStartupTables(ctx context.Context) error {
 			}()
 
 			select {
-			case <-ctx.Done():
+			case <-startupCtx.Done():
 			case <-view.WaitRunning():
 			}
 			return nil
@@ -764,7 +725,6 @@ func (g *Processor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sara
 			if !ok {
 				return nil
 			}
-
 			select {
 			case part.input <- &message{
 				key:       string(msg.Key),
@@ -776,13 +736,13 @@ func (g *Processor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sara
 				value:     msg.Value,
 			}:
 			case <-stopping:
-				return fmt.Errorf("partition processor has stopped, consume claim cannot continue")
+				return nil
 			case <-session.Context().Done():
 				return nil
 			}
 
 		case <-stopping:
-			return fmt.Errorf("partition processor has stopped, consume claim cannot continue")
+			return nil
 		case <-session.Context().Done():
 			return nil
 		}

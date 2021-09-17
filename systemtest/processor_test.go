@@ -368,7 +368,7 @@ func TestCallbackFail(t *testing.T) {
 		t.Skipf("Ignoring systemtest. pass '-args -systemtest' to `go test` to include them")
 	}
 
-	t.Skipf("Skipping as this triggers a bug that never finishes the test (https://github.com/lovoo/goka/issues/330)")
+	// t.Skipf("Skipping as this triggers a bug that never finishes the test (https://github.com/lovoo/goka/issues/330)")
 
 	var (
 		group       goka.Group = "goka-systemtest-callback-fail"
@@ -460,8 +460,9 @@ func TestProcessorSlowStuck(t *testing.T) {
 			group,
 			goka.Input(goka.Stream(inputStream), new(codec.Int64), func(ctx goka.Context, msg interface{}) {
 				val := msg.(int64)
-				time.Sleep(500 * time.Millisecond)
-				if ctx.Partition() == 0 && val > 10000 {
+				time.Sleep(500 * time.Microsecond)
+				log.Printf("%d", val)
+				if ctx.Partition() == 0 && val > 50 {
 					// do an invalid action
 					panic("asdf")
 				}

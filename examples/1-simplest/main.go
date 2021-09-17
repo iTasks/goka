@@ -54,10 +54,10 @@ func runProcessor() {
 			counter = val.(int64)
 		}
 		counter++
+		log.Printf("message received count is: %d", counter)
 		// SetValue stores the incremented counter in the group table for in
 		// the message's key.
 		ctx.SetValue(counter)
-		log.Printf("key = %s, counter = %v, msg = %v", ctx.Key(), counter, msg)
 	}
 
 	// Define a new processor group. The group defines all inputs, outputs, and
@@ -107,12 +107,13 @@ func main() {
 	// can be a lot of messages.
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	goka.ReplaceGlobalConfig(config)
+	goka.Debug(true, false)
 
 	tm, err := goka.NewTopicManager(brokers, goka.DefaultConfig(), tmc)
 	if err != nil {
 		log.Fatalf("Error creating topic manager: %v", err)
 	}
-	err = tm.EnsureStreamExists(string(topic), 8)
+	err = tm.EnsureStreamExists(string(topic), 1)
 	if err != nil {
 		log.Printf("Error creating kafka topic %s: %v", topic, err)
 	}
