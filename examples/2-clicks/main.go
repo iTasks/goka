@@ -106,6 +106,7 @@ func runView() {
 	view, err := goka.NewView(brokers,
 		goka.GroupTable(group),
 		new(userCodec),
+		goka.WithViewAutoReconnect(),
 	)
 	if err != nil {
 		panic(err)

@@ -154,7 +154,7 @@ func TestHotStandby(t *testing.T) {
 
 	// stop everything and wait until it's shut down
 	cancel()
-	test.AssertNil(t, errg.Wait().NilOrError())
+	test.AssertNil(t, errg.Wait().ErrorOrNil())
 }
 
 // Tests the processor option WithRecoverAhead. This requires a (local) running kafka cluster.
@@ -287,7 +287,7 @@ func TestRecoverAhead(t *testing.T) {
 
 	// stop everything and wait until it's shut down
 	cancel()
-	test.AssertNil(t, errg.Wait().NilOrError())
+	test.AssertNil(t, errg.Wait().ErrorOrNil())
 }
 
 // TestRebalance runs some processors to test rebalance. It's merely a
@@ -360,7 +360,7 @@ func TestRebalance(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 
-	test.AssertNil(t, errg.Wait().NilOrError())
+	test.AssertNil(t, errg.Wait().ErrorOrNil())
 }
 
 func TestCallbackFail(t *testing.T) {
@@ -368,10 +368,12 @@ func TestCallbackFail(t *testing.T) {
 		t.Skipf("Ignoring systemtest. pass '-args -systemtest' to `go test` to include them")
 	}
 
+	// goka.Debug(true, false)
+
 	// t.Skipf("Skipping as this triggers a bug that never finishes the test (https://github.com/lovoo/goka/issues/330)")
 
 	var (
-		group       goka.Group = "goka-systemtest-callback-fail"
+		group       goka.Group = goka.Group(fmt.Sprintf("goka-systemtest-callback-fail-%d", time.Now().Unix()))
 		inputStream string     = string(group) + "-input"
 		basepath               = os.TempDir()
 	)
@@ -383,7 +385,7 @@ func TestCallbackFail(t *testing.T) {
 	tm, err := goka.TopicManagerBuilderWithConfig(cfg, tmc)([]string{*broker})
 	test.AssertNil(t, err)
 
-	err = tm.EnsureStreamExists(inputStream, 20)
+	err = tm.EnsureStreamExists(inputStream, 1)
 	test.AssertNil(t, err)
 
 	em, err := goka.NewEmitter([]string{*broker}, goka.Stream(inputStream), new(codec.Int64))
@@ -427,9 +429,8 @@ func TestCallbackFail(t *testing.T) {
 	errg.Go(func() error {
 		return proc.Run(ctx)
 	})
-	err = errg.Wait().NilOrError()
-	log.Printf("%v", err)
-	test.AssertTrue(t, strings.Contains(err.Error(), "callback failed"))
+	err = errg.Wait().ErrorOrNil()
+	test.AssertTrue(t, strings.Contains(err.Error(), "error processing message"))
 }
 
 func TestProcessorSlowStuck(t *testing.T) {
@@ -493,7 +494,7 @@ func TestProcessorSlowStuck(t *testing.T) {
 	errg.Go(func() error {
 		return proc.Run(ctx)
 	})
-	err = errg.Wait().NilOrError()
+	err = errg.Wait().ErrorOrNil()
 	log.Printf("%v", err)
 	test.AssertTrue(t, strings.Contains(err.Error(), "callback failed"))
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/hashicorp/go-multierror"
 	"github.com/lovoo/goka/multierr"
 	"github.com/lovoo/goka/storage"
 )
@@ -256,10 +257,9 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 	g.state.SetState(ProcStateStarting)
 
 	// collect all errors before leaving
-	merrors := new(multierr.Errors)
+	var errs *multierror.Error
 	defer func() {
-		_ = merrors.Collect(rerr)
-		rerr = merrors.NilOrError()
+		rerr = multierror.Append(errs, rerr).ErrorOrNil()
 	}()
 
 	var err error
@@ -284,7 +284,7 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 		g.log.Debugf("closing producer")
 		defer g.log.Debugf("producer ... closed")
 		if err := g.producer.Close(); err != nil {
-			merrors.Collect(fmt.Errorf("error closing producer: %v", err))
+			errs = multierror.Append(errs, fmt.Errorf("error closing producer: %w", err))
 		}
 	}()
 
@@ -310,7 +310,7 @@ func (g *Processor) Run(ctx context.Context) (rerr error) {
 		return g.rebalanceLoop(ctx)
 	})
 
-	return errg.Wait().NilOrError()
+	return errg.Wait().ErrorOrNil()
 }
 
 func (g *Processor) rebalanceLoop(ctx context.Context) (rerr error) {
@@ -321,6 +321,13 @@ func (g *Processor) rebalanceLoop(ctx context.Context) (rerr error) {
 		return fmt.Errorf(errBuildConsumer, err)
 	}
 
+	go func() {
+		errs := consumerGroup.Errors()
+		for err := range errs {
+			g.log.Printf("error in consumer group: %v", err)
+		}
+	}()
+
 	var topics []string
 	for _, e := range g.graph.InputStreams() {
 		topics = append(topics, e.Topic())
@@ -329,26 +336,34 @@ func (g *Processor) rebalanceLoop(ctx context.Context) (rerr error) {
 		topics = append(topics, g.graph.LoopStream().Topic())
 	}
 
-	var errs = new(multierr.Errors)
+	var errs *multierror.Error
 
 	defer func() {
-		errs.Collect(rerr)
-		rerr = errs.NilOrError()
+		rerr = multierror.Append(errs, rerr).ErrorOrNil()
 	}()
 
 	defer func() {
 		g.log.Debugf("closing consumer group")
 		defer g.log.Debugf("closing consumer group ... done")
-		errs.Collect(consumerGroup.Close())
+		errs = multierror.Append(errs, consumerGroup.Close())
 	}()
 
 	for {
 		err := consumerGroup.Consume(ctx, topics, g)
-		var cbErr *errProcessing
-		if errors.As(err, &cbErr) {
+		var (
+			errProc  *errProcessing
+			errSetup *errSetup
+		)
+
+		if errors.As(err, &errProc) {
 			g.log.Printf("error processing message (non-transient), stopping execution: %v", err)
-			return cbErr
+			return err
 		}
+		if errors.As(err, &errSetup) {
+			g.log.Printf("setup error (non-transient), stopping execution: %v", err)
+			return err
+		}
+
 		g.log.Printf("Error executing group consumer (continuing execution): %v", err)
 
 		select {
@@ -563,18 +578,22 @@ func (g *Processor) Setup(session sarama.ConsumerGroupSession) error {
 	// setup all processors
 	setupErrg, setupCtx := multierr.NewErrGroup(session.Context())
 	g.mTables.RLock()
-	for _, partition := range g.partitions {
+	for partID, partition := range g.partitions {
 		pproc := partition
 		setupErrg.Go(func() error {
 			// the partition processors need two contexts:
 			// setupCtx --> for this setup, which we'll wait for
 			// the runner ctx, which is active during a session
-			return pproc.Start(setupCtx, session.Context())
+			err := pproc.Start(setupCtx, session.Context())
+			if err != nil {
+				return newErrSetup(partID, err)
+			}
+			return nil
 		})
 	}
 	g.mTables.RUnlock()
 
-	return setupErrg.Wait().NilOrError()
+	return setupErrg.Wait().ErrorOrNil()
 }
 
 func (g *Processor) createAssignedPartitions(session sarama.ConsumerGroupSession) error {
@@ -640,6 +659,11 @@ func (g *Processor) createHotStandbyPartitions(session sarama.ConsumerGroupSessi
 	return nil
 }
 
+// hier geht's weiter:
+// * extra errors for cleanup und setup, damit wir differenzieren können.
+// * alles testen
+// * topic manager - poller separat PR
+
 // Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
 // but before the offsets are committed for the very last time.
 func (g *Processor) Cleanup(session sarama.ConsumerGroupSession) error {
@@ -655,19 +679,19 @@ func (g *Processor) Cleanup(session sarama.ConsumerGroupSession) error {
 		errg.Go(func() error {
 			err := pproc.Stop()
 			if err != nil {
-				return fmt.Errorf("error stopping partition processor %d: %v", partID, err)
+				g.log.Printf("Error running/stopping partition processor %d: %v", partID, err)
+				return err
 			}
 			return nil
 		})
 	}
 	g.mTables.RUnlock()
-	err := errg.Wait().NilOrError()
+	err := errg.Wait().ErrorOrNil()
 
 	// reset the partitions after the session ends
 	g.mTables.Lock()
 	defer g.mTables.Unlock()
 	g.partitions = make(map[int32]*PartitionProcessor)
-
 	return err
 }
 
@@ -793,7 +817,7 @@ func (g *Processor) StatsWithContext(ctx context.Context) *ProcessorStats {
 	}
 	g.mTables.RUnlock()
 
-	err := errg.Wait().NilOrError()
+	err := errg.Wait().ErrorOrNil()
 	if err != nil {
 		g.log.Printf("Error retrieving stats: %v", err)
 	}
@@ -881,7 +905,7 @@ func (g *Processor) VisitAll(ctx context.Context, name string, meta interface{})
 		return nil
 	})
 
-	return errg.Wait().NilOrError()
+	return errg.Wait().ErrorOrNil()
 }
 
 func prepareTopics(brokers []string, gg *GroupGraph, opts *poptions) (npar int, err error) {

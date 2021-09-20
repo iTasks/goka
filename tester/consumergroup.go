@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Shopify/sarama"
+	"github.com/hashicorp/go-multierror"
 	"github.com/lovoo/goka"
 	"github.com/lovoo/goka/multierr"
 )
@@ -92,19 +93,19 @@ func (cg *consumerGroup) Consume(ctx context.Context, topics []string, handler s
 		}
 		cg.state.SetState(cgStateConsuming)
 
-		errs := new(multierr.Errors)
+		var errs *multierror.Error
 
 		// wait for runner errors and collect error
-		errs.Collect(errg.Wait().NilOrError())
+		errs = multierror.Append(errs, errg.Wait().ErrorOrNil())
 		cg.state.SetState(cgStateCleaning)
 
 		// cleanup and collect errors
-		errs.Collect(handler.Cleanup(session))
+		errs = multierror.Append(errs, handler.Cleanup(session))
 
 		// remove current sessions
 		cg.currentSession = nil
 
-		err = errs.NilOrError()
+		err = errs.ErrorOrNil()
 		if err != nil {
 			return fmt.Errorf("Error running or cleaning: %v", err)
 		}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/hashicorp/go-multierror"
 	"github.com/lovoo/goka/multierr"
 )
 
@@ -238,7 +239,7 @@ func (pp *PartitionProcessor) Start(setupCtx, ctx context.Context) error {
 	}
 
 	// here we wait for our table and the joins to recover
-	err := setupErrg.Wait().NilOrError()
+	err := setupErrg.Wait().ErrorOrNil()
 	if err != nil {
 		return fmt.Errorf("Setup failed. Cannot start processor for partition %d: %v", pp.partition, err)
 	}
@@ -309,40 +310,39 @@ func (pp *PartitionProcessor) Stop() error {
 	// stop the stats updating/serving loop
 	pp.cancelStatsLoop()
 
-	errs := new(multierr.Errors)
-
 	// wait for the runner to be done
-	if err := pp.runnerGroup.Wait().NilOrError(); err != nil {
-		errs.Collect(fmt.Errorf("callback failed: %w", err))
-	}
+	runningErrs := multierror.Append(pp.runnerGroup.Wait().ErrorOrNil())
 
 	// close all the tables
-	errg, _ := multierr.NewErrGroup(context.Background())
+	stopErrg, _ := multierr.NewErrGroup(context.Background())
 	for _, join := range pp.joins {
 		join := join
-		errg.Go(func() error {
+		stopErrg.Go(func() error {
 			return join.Close()
 		})
 	}
 
+	// close processor table, if there is one
 	if pp.table != nil {
-		errg.Go(func() error {
+		stopErrg.Go(func() error {
 			return pp.table.Close()
 		})
 	}
 
-	// wait for the tables to be done
-	return errs.Collect(errg.Wait().NilOrError()).NilOrError()
+	// return stopping errors and running errors
+	return multierror.Append(stopErrg.Wait().ErrorOrNil(), runningErrs).ErrorOrNil()
 }
 
 func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
 	pp.log.Debugf("starting")
 	defer pp.log.Debugf("stopped")
 
-	errs := new(multierr.Errors)
+	var mutexErr sync.Mutex
+
 	defer func() {
-		errs.Collect(rerr)
-		rerr = errs.NilOrError()
+		mutexErr.Lock()
+		defer mutexErr.Unlock()
+		rerr = multierror.Append(rerr).ErrorOrNil()
 	}()
 
 	var (
@@ -352,7 +352,9 @@ func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
 			// only fail processor if context not already Done
 			select {
 			case <-ctx.Done():
-				rerr = err
+				mutexErr.Lock()
+				rerr = newErrProcessing(pp.partition, fmt.Errorf("synchronous error in callback: %v", err))
+				mutexErr.Unlock()
 				return
 			default:
 			}
@@ -365,7 +367,9 @@ func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
 		// asyncFailer is called asynchronously from other goroutines, e.g.
 		// when the promise of a Emit (using a producer internally) fails
 		asyncFailer = func(err error) {
-			errs.Collect(err)
+			mutexErr.Lock()
+			rerr = multierror.Append(rerr, newErrProcessing(pp.partition, fmt.Errorf("asynchronous error from callback: %v", err)))
+			mutexErr.Unlock()
 			closeOnce.Do(func() { close(asyncErrs) })
 		}
 
@@ -374,7 +378,9 @@ func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			rerr = fmt.Errorf("%v\n%v", r, strings.Join(userStacktrace(), "\n"))
+			mutexErr.Lock()
+			rerr = newErrProcessing(pp.partition, fmt.Errorf("panic in callback: %v\n%v", r, strings.Join(userStacktrace(), "\n")))
+			mutexErr.Unlock()
 			return
 		}
 
@@ -400,7 +406,7 @@ func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
 			}
 			err := pp.processMessage(ctx, &wg, ev, syncFailer, asyncFailer)
 			if err != nil {
-				return fmt.Errorf("error processing message: from %s %v", string(ev.value), err)
+				return newErrProcessing(pp.partition, err)
 			}
 
 			pp.enqueueStatsUpdate(ctx, func() { pp.updateStatsWithMessage(ev) })
@@ -413,7 +419,7 @@ func (pp *PartitionProcessor) run(ctx context.Context) (rerr error) {
 			}
 			err := pp.processVisit(ctx, &wg, visit, syncFailer, asyncFailer)
 			if err != nil {
-				return fmt.Errorf("Error visiting %s for %s: %v", visit.name, visit.key, err)
+				return newErrProcessing(pp.partition, fmt.Errorf("Error visiting %s for %s: %v", visit.name, visit.key, err))
 			}
 		case <-asyncErrs:
 			pp.log.Debugf("Errors occurred asynchronously. Will exit partition processor")
@@ -512,7 +518,7 @@ func (pp *PartitionProcessor) collectStats(ctx context.Context) *PartitionProcSt
 		})
 	}
 
-	err := errg.Wait().NilOrError()
+	err := errg.Wait().ErrorOrNil()
 	if err != nil {
 		pp.log.Printf("Error retrieving stats: %v", err)
 	}
