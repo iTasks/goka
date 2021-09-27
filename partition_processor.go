@@ -75,7 +75,8 @@ type PartitionProcessor struct {
 	// runnerErrors store the errors occuring during runtime of the
 	// partition processor. It is created in Setup and after the runnerGroup
 	// finishes.
-	runnerErrors chan error
+	runnerErrors     chan error
+	runnerErrorsOnce sync.Once
 
 	runMode PPRunMode
 
@@ -168,6 +169,7 @@ func newPartitionProcessor(partition int32,
 		cancelStatsLoop: cancel,
 		commit:          commit,
 		runMode:         runMode,
+		runnerErrors:    make(chan error, 1),
 	}
 
 	go partProc.runStatsLoop(statsLoopCtx)
@@ -262,14 +264,14 @@ func (pp *PartitionProcessor) Start(setupCtx, ctx context.Context) error {
 	for _, join := range pp.joins {
 		join := join
 		pp.runnerGroup.Go(func() error {
-			return join.CatchupForever(runnerCtx, false)
+			return pp.reportRunnerError(
+				join.CatchupForever(runnerCtx, false),
+			)
 		})
 	}
 
 	// now run the processor in a runner-group
 	pp.runnerGroup.Go(func() error {
-		defer pp.state.SetState(PPStateStopping)
-
 		var err error
 		// depending on the run mode, we'll do
 		switch pp.runMode {
@@ -282,18 +284,40 @@ func (pp *PartitionProcessor) Start(setupCtx, ctx context.Context) error {
 				err = pp.table.CatchupForever(runnerCtx, false)
 			}
 		default:
-			return fmt.Errorf("processor has invalid run mode")
+			err = fmt.Errorf("processor has invalid run mode")
 		}
 		if err != nil {
 			pp.log.Debugf("Run failed with error: %v", err)
 		}
-		return err
+		return pp.reportRunnerError(err)
 	})
 	return nil
 }
 
-func (pp *PartitionProcessor) stopping() <-chan struct{} {
-	return pp.state.WaitForStateMin(PPStateStopping)
+func (pp *PartitionProcessor) reportRunnerError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var errPushed bool
+	pp.runnerErrorsOnce.Do(func() {
+		select {
+		case pp.runnerErrors <- err:
+			errPushed = true
+		default:
+		}
+		defer close(pp.runnerErrors)
+	})
+
+	if errPushed {
+		return nil
+	}
+
+	return err
+}
+
+func (pp *PartitionProcessor) errors() <-chan error {
+	return pp.runnerErrors
 }
 
 // Stop stops the partition processor

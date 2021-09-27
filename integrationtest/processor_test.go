@@ -3,7 +3,6 @@ package integrationtest
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +59,6 @@ func TestErrorCallback(t *testing.T) {
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
 			gkt := tester.New(t)
-
 			proc, _ := goka.NewProcessor(nil,
 				goka.DefineGroup(
 					"test",
@@ -85,7 +83,7 @@ func TestErrorCallback(t *testing.T) {
 			select {
 			case <-done:
 				test.AssertNotNil(t, err)
-				log.Printf("error. %v", err)
+				// log.Printf("error: %v", err)
 				test.AssertTrue(t, strings.Contains(err.Error(), "error processing message"))
 			case <-time.After(10 * time.Second):
 				t.Errorf("processor did not shut down as expected")

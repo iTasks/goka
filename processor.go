@@ -324,7 +324,7 @@ func (g *Processor) rebalanceLoop(ctx context.Context) (rerr error) {
 	go func() {
 		errs := consumerGroup.Errors()
 		for err := range errs {
-			g.log.Printf("error in consumer group: %v", err)
+			g.log.Printf("error while executing consumer group: %v", err)
 		}
 	}()
 
@@ -356,15 +356,17 @@ func (g *Processor) rebalanceLoop(ctx context.Context) (rerr error) {
 		)
 
 		if errors.As(err, &errProc) {
-			g.log.Printf("error processing message (non-transient), stopping execution: %v", err)
+			g.log.Debugf("error processing message (non-transient), shutting down processor: %v", err)
 			return err
 		}
 		if errors.As(err, &errSetup) {
-			g.log.Printf("setup error (non-transient), stopping execution: %v", err)
+			g.log.Debugf("setup error (non-transient), shutting down processor: %v", err)
 			return err
 		}
 
-		g.log.Printf("Error executing group consumer (continuing execution): %v", err)
+		if err != nil {
+			g.log.Printf("Error executing group consumer (continuing execution, rebalance after short sleep): %v", err)
+		}
 
 		select {
 		case <-time.After(5 * time.Second):
@@ -741,7 +743,7 @@ func (g *Processor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sara
 	}
 
 	messages := claim.Messages()
-	stopping := part.stopping()
+	errors := part.errors()
 
 	for {
 		select {
@@ -759,14 +761,14 @@ func (g *Processor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sara
 				headers:   msg.Headers,
 				value:     msg.Value,
 			}:
-			case <-stopping:
-				return nil
+			case err := <-errors:
+				return err
 			case <-session.Context().Done():
 				return nil
 			}
 
-		case <-stopping:
-			return nil
+		case err := <-errors:
+			return err
 		case <-session.Context().Done():
 			return nil
 		}

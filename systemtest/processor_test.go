@@ -368,12 +368,98 @@ func TestCallbackFail(t *testing.T) {
 		t.Skipf("Ignoring systemtest. pass '-args -systemtest' to `go test` to include them")
 	}
 
-	// goka.Debug(true, false)
-
-	// t.Skipf("Skipping as this triggers a bug that never finishes the test (https://github.com/lovoo/goka/issues/330)")
-
 	var (
 		group       goka.Group = goka.Group(fmt.Sprintf("goka-systemtest-callback-fail-%d", time.Now().Unix()))
+		inputStream string     = string(group) + "-input"
+		basepath               = os.TempDir()
+	)
+
+	tmc := goka.NewTopicManagerConfig()
+	tmc.Table.Replication = 1
+	tmc.Stream.Replication = 1
+	cfg := goka.DefaultConfig()
+	tm, err := goka.TopicManagerBuilderWithConfig(cfg, tmc)([]string{*broker})
+	test.AssertNil(t, err)
+
+	err = tm.EnsureStreamExists(inputStream, 1)
+	test.AssertNil(t, err)
+
+	em, err := goka.NewEmitter([]string{*broker}, goka.Stream(inputStream), new(codec.Int64))
+	test.AssertNil(t, err)
+
+	proc, err := goka.NewProcessor([]string{*broker},
+		goka.DefineGroup(
+			group,
+			goka.Input(goka.Stream(inputStream), new(codec.Int64), func(ctx goka.Context, msg interface{}) {
+				val := msg.(int64)
+				time.Sleep(1 * time.Millisecond)
+				if ctx.Partition() == 0 && val > 100 {
+					// do an invalid action
+					ctx.Emit("blubbasdf", "asdf", nil)
+				}
+			}),
+		),
+		goka.WithTopicManagerBuilder(goka.TopicManagerBuilderWithTopicManagerConfig(tmc)),
+		goka.WithStorageBuilder(storage.DefaultBuilder(basepath)),
+		goka.WithPartitionChannelSize(1),
+	)
+
+	test.AssertNil(t, err)
+
+	errg, ctx := multierr.NewErrGroup(context.Background())
+
+	errg.Go(func() error {
+		ticker := time.NewTicker(50 * time.Microsecond)
+		defer em.Finish()
+		var i int64
+		for {
+			select {
+			case <-ticker.C:
+				i++
+				test.AssertNil(t, em.EmitSync(fmt.Sprintf("%d", i%20), i))
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
+	errg.Go(func() error {
+		return proc.Run(ctx)
+	})
+	err = errg.Wait().ErrorOrNil()
+	test.AssertTrue(t, strings.Contains(err.Error(), "error processing message"))
+}
+
+type testCodec struct{}
+
+func (fc *testCodec) Decode(data []byte) (interface{}, error) {
+	value := string(data)
+
+	if value == "fail" {
+		return nil, fmt.Errorf("decode failed")
+	}
+
+	if value == "nil" {
+		return nil, nil
+	}
+
+	if value == "panic" {
+		panic("decode panic")
+	}
+
+	return string(data), nil
+}
+
+func (fc *testCodec) Encode(value interface{}) ([]byte, error) {
+	return []byte(value.(string)), nil
+}
+
+func TestCodecFail(t *testing.T) {
+	if !*systemtest {
+		t.Skipf("Ignoring systemtest. pass '-args -systemtest' to `go test` to include them")
+	}
+
+	var (
+		group       goka.Group = goka.Group(fmt.Sprintf("goka-systemtest-codec-fail-%d", time.Now().Unix()))
 		inputStream string     = string(group) + "-input"
 		basepath               = os.TempDir()
 	)
